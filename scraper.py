@@ -37,29 +37,24 @@ def clean_seats(seats_str):
 
 async def get_dropdown_options(page, selector):
     """Helper to get value/label pairs from a dropdown"""
-    # Wait for the dropdown to actually have options inside it
     try:
         await page.wait_for_selector(f"{selector} option", timeout=5000)
     except:
-        pass # Proceed anyway, maybe it's empty
-        
+        pass 
     options = await page.locator(f"{selector} option").all()
     results = []
     for option in options:
         val = await option.get_attribute("value")
         label = await option.inner_text()
-        if val: # Skip empty placeholders
+        if val: 
             results.append({"value": val, "label": label.strip()})
     return results
 
 async def scrape_bark_air(page):
     print("🐶 Scraping Bark Air (Direct URL Mode)...")
     
-    # Extended City List covering all known/potential hubs
     cities = [
-        "London", "New York", "Los Angeles", "Paris", 
-        "San Francisco", "Madrid", "Seattle", "Honolulu", 
-        "Lisbon", "Kailua-Kona"
+        "London", "New York", "Los Angeles", "Paris", "San Francisco", "Madrid", "Seattle", "Honolulu", "Lisbon", "Kailua-Kona"
     ]
     
     all_flights = []
@@ -75,7 +70,7 @@ async def scrape_bark_air(page):
             
             try:
                 await page.goto(url, timeout=30000)
-                await page.wait_for_timeout(1500) # Short wait for Direct URL is usually fine
+                await page.wait_for_timeout(1500)
                 
                 cards = await page.locator(".flight_box").all()
                 if len(cards) == 0: continue
@@ -115,15 +110,10 @@ async def scrape_bark_air(page):
     return all_flights
 
 async def scrape_k9_jets(page):
-    print("✈️ Scraping K9 Jets (Nuclear Reload + Network Idle)...")
+    print("✈️ Scraping K9 Jets (Reset & Retry Strategy)...")
     
     await page.goto("https://www.k9jets.com/routes/", timeout=60000) 
-    
-    # FIX 1: Wait for Network Idle (Ensures all AJAX dropdowns are loaded)
-    try:
-        await page.wait_for_load_state("networkidle", timeout=10000)
-    except:
-        await page.wait_for_timeout(5000) # Fallback wait
+    await page.wait_for_timeout(5000)
     
     origins = await get_dropdown_options(page, 'select[name="pa_departure-location"]')
     print(f"   Found {len(origins)} Origins to scan.")
@@ -134,30 +124,28 @@ async def scrape_k9_jets(page):
         print(f"   📍 Scanning Origin: {origin['label']}...")
         
         try:
-            await page.goto("https://www.k9jets.com/routes/", timeout=60000)
+            # FIX 1: Click the "Reset" button (Refresh Icon) to clear state
+            reset_btn = page.locator('.jet-remove-all-filters__button')
+            if await reset_btn.is_visible():
+                await reset_btn.click()
+                await page.wait_for_timeout(2000) # Wait for clear
             
-            # FIX 2: Wait for network idle AGAIN after reload
-            try:
-                await page.wait_for_load_state("networkidle", timeout=10000)
-            except:
-                await page.wait_for_timeout(3000)
-            
-            # Select Origin (Toggle trick)
-            await page.select_option('select[name="pa_departure-location"]', "")
-            await page.wait_for_timeout(500)
+            # Select Origin
             await page.select_option('select[name="pa_departure-location"]', origin['value'])
             
-            # FIX 3: Wait specifically for the Destination dropdown to populate
-            # We assume if the origin has destinations, the dropdown will change from length 1 (placeholder) to >1
-            try:
-                await page.wait_for_function(
-                    "document.querySelectorAll('select[name=\"pa_arrival-location\"] option').length > 1",
-                    timeout=5000
-                )
-            except:
-                await page.wait_for_timeout(2000) # Fallback
+            # FIX 2: RETRY LOOP for Destinations
+            # We check 5 times (total 5 seconds) to see if destinations appear
+            dests = []
+            for _ in range(5):
+                dests = await get_dropdown_options(page, 'select[name="pa_arrival-location"]')
+                # If we found valid destinations (more than just placeholder), break loop
+                if len(dests) > 0 and dests[0]['value'] != "":
+                    break
+                await page.wait_for_timeout(1000)
             
-            dests = await get_dropdown_options(page, 'select[name="pa_arrival-location"]')
+            if not dests:
+                print(f"      ⚠️ No destinations found for {origin['label']} (Skipping)")
+                continue
             
             for dest in dests:
                 if dest['value'] == "" or "flying to" in dest['label'].lower(): continue
@@ -165,12 +153,19 @@ async def scrape_k9_jets(page):
                 print(f"      ↳ Dest: {dest['label']}")
                 
                 try:
+                    # Re-assert selections to keep session alive
                     await page.select_option('select[name="pa_departure-location"]', origin['value'])
                     await page.wait_for_timeout(200)
                     await page.select_option('select[name="pa_arrival-location"]', dest['value'])
-                    await page.wait_for_timeout(500)
+                    await page.wait_for_timeout(1000)
                     
-                    months = await get_dropdown_options(page, 'select[name="pa_flight-month"]')
+                    # Get Months (Retry loop here too)
+                    months = []
+                    for _ in range(3):
+                        months = await get_dropdown_options(page, 'select[name="pa_flight-month"]')
+                        if len(months) > 0: break
+                        await page.wait_for_timeout(500)
+                        
                     if not months: continue
 
                     for month in months:
