@@ -244,9 +244,26 @@ async def scrape_k9_jets(page):
     return all_flights
 
 async def save_to_supabase(data):
-    print(f"💾 Saving {len(data)} rows to Supabase...")
+    print(f"💾 Processing {len(data)} scraped rows...")
     
+    # --- FIX: DEDUPLICATION STEP ---
+    # We create a dictionary to filter out duplicates based on the unique combination
+    unique_data = {}
     for item in data:
+        # Create a unique "signature" for this flight
+        # Example: "K9 Jets_London -> Dubai_2025-05-20"
+        signature = f"{item['competitor']}_{item['route']}_{item['date']}"
+        
+        # If we haven't seen this signature yet, keep it.
+        # If we HAVE seen it, this line overwrites the old one (effectively removing duplicates)
+        unique_data[signature] = item
+    
+    # Convert back to a list
+    clean_data = list(unique_data.values())
+    print(f"   📉 Deduplicated: Removed {len(data) - len(clean_data)} duplicate entries.")
+    print(f"   🚀 Uploading {len(clean_data)} unique snapshots to Supabase...")
+
+    for item in clean_data:
         try:
             # Parse Date
             dt_obj = parser.parse(item['date'])
@@ -274,12 +291,12 @@ async def save_to_supabase(data):
             # Insert Snapshot
             snapshot_payload = {
                 "flight_id": flight_id,
-                "price": item.get('price'), # This is now a float
-                "seats_available": item.get('seats'), # This is now an int
+                "price": item.get('price'),
+                "seats_available": item.get('seats'),
                 "status": item.get('status', 'Available')
             }
             supabase.table("flight_snapshots").insert(snapshot_payload).execute()
-            print(f"✅ Saved snapshot for Flight {flight_id}")
+            # print(f"✅ Saved snapshot for Flight {flight_id}") # Commented out to reduce noise
 
 async def main():
     async with async_playwright() as p:
