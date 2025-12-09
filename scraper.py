@@ -207,9 +207,12 @@ async def scrape_k9_jets(page):
                             if await date_el.count() == 0: continue
                             raw_date = await date_el.inner_text()
                             
-                            # K9 search results usually list route in description
-                            route_el = card.locator(".elementor-icon-box-description")
-                            raw_route = await route_el.inner_text() if await route_el.count() > 0 else "Unknown"
+                            route_el = card.locator(".elementor-icon-box-description").first
+                            if await route_el.count() > 0:
+                                raw_text = await route_el.inner_text()
+                                clean_route = raw_text.replace(" - ", " -> ").strip()
+                            else:
+                                clean_route = f"{origin['label']} -> {dest['label']}"
 
                             price_el = card.locator(".woocommerce-Price-amount").first
                             price_text = await price_el.inner_text() if await price_el.count() > 0 else "0"
@@ -223,7 +226,7 @@ async def scrape_k9_jets(page):
                             all_flights.append({
                                 "competitor": "K9 Jets",
                                 "date": raw_date.strip(),
-                                "route": raw_route.strip(),
+                                "route": clean_route,
                                 "operator": "Pegasus/AirX", 
                                 "price": cleaned_price,
                                 "seats": cleaned_seats,
