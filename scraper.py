@@ -280,7 +280,7 @@ async def save_to_supabase(data):
 
 async def main():
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
+        browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         
         bark_data = await scrape_bark_air(page)
