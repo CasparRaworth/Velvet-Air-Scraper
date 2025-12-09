@@ -562,10 +562,27 @@ async def save_to_supabase(data):
         except:
             continue
 
+        # Parse origin / destination from the route string
+        route_str = item.get("route", "").strip()
+        if "->" in route_str:
+            left, right = route_str.split("->", 1)
+            origin = left.strip()
+            dest_raw = right.strip()
+            # K9 routes often look like "London, UK - Van Nuys, California"
+            # In that case we only want the final destination after the last " - "
+            if " - " in dest_raw:
+                destination = dest_raw.split(" - ")[-1].strip()
+            else:
+                destination = dest_raw
+        else:
+            # Fallback: treat the whole string as both origin and destination
+            origin = route_str
+            destination = route_str
+
         flight_payload = {
             "competitor": item['competitor'],
-            "origin": item['route'].split("->")[0].strip(),
-            "destination": item['route'].split("->")[-1].strip(),
+            "origin": origin,
+            "destination": destination,
             "departure_date": clean_date,
             "operator": item.get('operator')
         }
