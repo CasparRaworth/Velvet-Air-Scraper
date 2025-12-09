@@ -122,90 +122,181 @@ async def scrape_bark_air(page):
     print(f"\nFound {len(all_flights)} TOTAL Bark flights.")
     return all_flights
 
-async def scrape_k9_jets(page):
+async def scrape_k9_jets_ajax(page):
     """
-    K9 Jets scraper using enhanced "scrape all visible" strategy with infinite scroll.
-    Since the AJAX dropdowns don't populate reliably in headless mode,
-    we scrape ALL flights from the main page with aggressive scrolling.
+    AJAX-driven approach: Interact with dropdowns to get all origin/destination combinations.
+    Returns list of flights if successful, empty list if AJAX fails.
     """
-    print("✈️ Scraping K9 Jets (Enhanced All-Flights Strategy)...")
+    print("   🔄 Strategy 1: AJAX Filter Approach...")
+    
+    all_flights = []
+    seen_flights = set()
+    
+    try:
+        await page.goto("https://www.k9jets.com/routes/", timeout=60000)
+        await handle_cookie_banner(page)
+        await page.wait_for_timeout(3000)  # Give AJAX time to initialize
+        
+        # Get initial origin options
+        origins = await get_dropdown_options(page, 'select[name="pa_departure-location"]')
+        origins = [o for o in origins if o['value'] and "flying from" not in o['label'].lower()]
+        
+        if len(origins) == 0:
+            print("      ⚠️  No origin options found")
+            return []
+        
+        print(f"      → Found {len(origins)} origins to test")
+        
+        # Try first origin to see if destinations populate
+        test_origin = origins[0]
+        await page.select_option('select[name="pa_departure-location"]', test_origin['value'])
+        await page.wait_for_timeout(3000)  # Wait for AJAX
+        
+        test_dests = await get_dropdown_options(page, 'select[name="pa_arrival-location"]')
+        test_dests = [d for d in test_dests if d['value'] and "flying to" not in d['label'].lower()]
+        
+        if len(test_dests) == 0:
+            print("      ⚠️  AJAX not populating destinations (headless issue)")
+            return []
+        
+        print(f"      ✅ AJAX working! Found {len(test_dests)} destinations for test origin")
+        
+        # Full AJAX scrape
+        for idx, origin in enumerate(origins):
+            try:
+                await page.goto("https://www.k9jets.com/routes/", timeout=60000)
+                await handle_cookie_banner(page)
+                await page.wait_for_timeout(2000)
+                
+                await page.select_option('select[name="pa_departure-location"]', origin['value'])
+                await page.wait_for_timeout(2500)
+                
+                destinations = await get_dropdown_options(page, 'select[name="pa_arrival-location"]')
+                destinations = [d for d in destinations if d['value'] and "flying to" not in d['label'].lower()]
+                
+                for dest in destinations:
+                    await page.select_option('select[name="pa_arrival-location"]', dest['value'])
+                    await page.wait_for_timeout(500)
+                    
+                    search_btn = page.locator('.apply-filters__button')
+                    if await search_btn.count() > 0:
+                        await search_btn.click()
+                        await page.wait_for_timeout(3000)
+                        
+                        cards = await page.locator("article.elementor-post").all()
+                        if len(cards) > 0:
+                            print(f"      [{idx+1}/{len(origins)}] {origin['label']} → {dest['label']}: {len(cards)} flights")
+                        
+                        for card in cards:
+                            try:
+                                date_el = card.locator(".elementor-icon-box-title")
+                                if await date_el.count() == 0: continue
+                                raw_date = await date_el.inner_text()
+                                
+                                route_el = card.locator(".elementor-icon-box-description")
+                                route_text = await route_el.inner_text() if await route_el.count() > 0 else f"{origin['label']} -> {dest['label']}"
+                                
+                                flight_key = f"{raw_date}|{route_text}"
+                                if flight_key in seen_flights:
+                                    continue
+                                seen_flights.add(flight_key)
+                                
+                                price_el = card.locator(".woocommerce-Price-amount").first
+                                price_text = await price_el.inner_text() if await price_el.count() > 0 else "0"
+                                
+                                seats_el = card.locator(".stock").first
+                                seats_text = await seats_el.inner_text() if await seats_el.count() > 0 else "0"
+                                
+                                operator_el = card.locator("p.elementor-heading-title")
+                                operator_text = "Unknown"
+                                for i in range(await operator_el.count()):
+                                    text = await operator_el.nth(i).inner_text()
+                                    if "Operator:" in text:
+                                        operator_text = text.replace("Operator:", "").strip()
+                                        break
+                                
+                                all_flights.append({
+                                    "competitor": "K9 Jets",
+                                    "date": raw_date.strip(),
+                                    "route": route_text.strip(),
+                                    "operator": operator_text,
+                                    "price": clean_price(price_text),
+                                    "seats": clean_seats(seats_text),
+                                    "status": "Available" if clean_seats(seats_text) > 0 else "Sold Out"
+                                })
+                            except:
+                                continue
+                        
+                        await page.goto("https://www.k9jets.com/routes/", timeout=60000)
+                        await page.wait_for_timeout(1000)
+            except:
+                continue
+        
+        return all_flights
+        
+    except Exception as e:
+        print(f"      ⚠️  AJAX approach failed: {str(e)[:100]}")
+        return []
+
+async def scrape_k9_jets_fallback(page):
+    """
+    Fallback: Scrape all visible flights with enhanced scrolling.
+    """
+    print("   📜 Strategy 2: Enhanced Scrolling (Fallback)...")
     
     all_flights = []
     seen_flights = set()
     
     await page.goto("https://www.k9jets.com/routes/", timeout=60000)
     await handle_cookie_banner(page)
-    await page.wait_for_load_state("domcontentloaded")
     await page.wait_for_timeout(2000)
     
-    print("   📜 Scrolling to load all flights (lazy loading)...")
-    
-    # Aggressive infinite scroll to load ALL flights
+    # Aggressive scrolling
     previous_count = 0
     no_change_count = 0
-    scroll_attempts = 0
-    max_scrolls = 50  # Safety limit
+    max_scrolls = 50
     
-    while scroll_attempts < max_scrolls:
-        # Get current count
+    for _ in range(max_scrolls):
         current_count = await page.locator("article.elementor-post").count()
         
-        # Scroll to bottom
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(1500)  # Wait for lazy load
-        
-        # Scroll back up a bit (sometimes triggers more loading)
+        await page.wait_for_timeout(1500)
         await page.evaluate("window.scrollBy(0, -500)")
         await page.wait_for_timeout(500)
         
-        # Check if new flights loaded
         if current_count == previous_count:
             no_change_count += 1
             if no_change_count >= 3:
-                # No new flights after 3 scroll attempts
-                print(f"   ✅ Loaded all available flights (stopped at {current_count})")
+                print(f"      → Loaded {current_count} flights total")
                 break
         else:
-            print(f"      → Loaded {current_count} flights so far...")
             no_change_count = 0
         
         previous_count = current_count
-        scroll_attempts += 1
     
-    # Final scroll to top to ensure everything is in DOM
-    await page.evaluate("window.scrollTo(0, 0)")
-    await page.wait_for_timeout(1000)
-    
-    # Now scrape all visible cards
     cards = await page.locator("article.elementor-post").all()
-    print(f"   📦 Scraping {len(cards)} total flight cards...")
+    print(f"      → Scraping {len(cards)} visible cards...")
     
-    for idx, card in enumerate(cards):
+    for card in cards:
         try:
-            # Extract date
             date_el = card.locator(".elementor-icon-box-title")
             if await date_el.count() == 0: continue
             raw_date = await date_el.inner_text()
             
-            # Extract route
             route_el = card.locator(".elementor-icon-box-description")
             route_text = await route_el.inner_text() if await route_el.count() > 0 else "Unknown Route"
             
-            # Prevent duplicates
             flight_key = f"{raw_date}|{route_text}"
             if flight_key in seen_flights:
                 continue
             seen_flights.add(flight_key)
             
-            # Extract price
             price_el = card.locator(".woocommerce-Price-amount").first
             price_text = await price_el.inner_text() if await price_el.count() > 0 else "0"
             
-            # Extract seats
             seats_el = card.locator(".stock").first
             seats_text = await seats_el.inner_text() if await seats_el.count() > 0 else "0"
             
-            # Extract operator
             operator_el = card.locator("p.elementor-heading-title")
             operator_text = "Unknown"
             for i in range(await operator_el.count()):
@@ -223,16 +314,30 @@ async def scrape_k9_jets(page):
                 "seats": clean_seats(seats_text),
                 "status": "Available" if clean_seats(seats_text) > 0 else "Sold Out"
             })
-            
-            # Progress indicator every 20 flights
-            if (idx + 1) % 20 == 0:
-                print(f"      → Processed {idx + 1}/{len(cards)} flights...")
-                
-        except Exception as e:
+        except:
             continue
     
-    print(f"Found {len(all_flights)} TOTAL K9 flights (after deduplication).")
     return all_flights
+
+async def scrape_k9_jets(page):
+    """
+    Hybrid K9 Jets scraper: Try AJAX approach first, fall back to scrolling if needed.
+    """
+    print("✈️ Scraping K9 Jets (Hybrid: AJAX + Fallback)...")
+    
+    # Try AJAX approach first
+    ajax_flights = await scrape_k9_jets_ajax(page)
+    
+    if len(ajax_flights) > 100:  # AJAX succeeded and got more than the 100-card limit
+        print(f"   ✅ AJAX approach successful!")
+        print(f"Found {len(ajax_flights)} TOTAL K9 flights.")
+        return ajax_flights
+    
+    # Fall back to scrolling
+    print("   → AJAX failed or returned limited results, using fallback...")
+    fallback_flights = await scrape_k9_jets_fallback(page)
+    print(f"Found {len(fallback_flights)} TOTAL K9 flights.")
+    return fallback_flights
 
 async def save_to_supabase(data):
     print(f"💾 Processing {len(data)} scraped rows...")
