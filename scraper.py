@@ -123,7 +123,7 @@ async def get_dropdown_options(page, selector):
     return results
 
 async def scrape_k9_jets(page):
-    print("✈️ Scraping K9 Jets (Deep Search)...")
+    print("✈️ Scraping K9 Jets (Deep Search - Standardized)...")
     await page.goto("https://www.k9jets.com/routes/", timeout=60000) 
     await page.wait_for_timeout(5000)
 
@@ -136,24 +136,19 @@ async def scrape_k9_jets(page):
     for origin in origins:
         print(f"   📍 Origin: {origin['label']}")
         
-        # Capture the current "Destination" list before we change anything
-        # We will use this to verify if the list actually changes later
-        old_dests_text = await page.locator('select[name="pa_arrival-location"]').inner_text()
-        
-        # Select Origin
-        await page.select_option('select[name="pa_departure-location"]', origin['value'])
-        
-        # --- FIX: SMART WAIT ---
-        # Wait up to 5 seconds for the Destination list to update
-        # We check if the text inside the dropdown is different from before
+        # --- FIX 1: FORCE REFRESH ---
+        # Toggle to empty first to force the website to register a "Change" event
         try:
-             await page.wait_for_function(
-                f"document.querySelector('select[name=\"pa_arrival-location\"]').innerText !== `{old_dests_text}`",
-                timeout=5000
-            )
-        except:
-            # If it didn't change (rare, or if destinations are identical), wait a safe 3 seconds
-            await page.wait_for_timeout(3000)
+            await page.select_option('select[name="pa_departure-location"]', "")
+            await page.wait_for_timeout(500)
+            await page.select_option('select[name="pa_departure-location"]', origin['value'])
+            
+            # Wait for Destinations to load (using the check-loop)
+            # We just wait a safe 3 seconds because the previous smart-wait was flaky for some users
+            await page.wait_for_timeout(3000) 
+        except Exception as e:
+            print(f"      ⚠️ Could not select origin {origin['label']}: {e}")
+            continue
 
         # 2. Get FRESH Destinations
         dests = await get_dropdown_options(page, 'select[name="pa_arrival-location"]')
@@ -165,11 +160,10 @@ async def scrape_k9_jets(page):
                 
             print(f"      ↳ Dest: {dest['label']}")
             
-            # Error handling for specific routes
             try:
-                # RE-ASSERT ORIGIN (To keep session alive)
+                # RE-ASSERT ORIGIN (Keep session alive)
                 await page.select_option('select[name="pa_departure-location"]', origin['value'])
-                await page.wait_for_timeout(1000) 
+                await page.wait_for_timeout(500) 
 
                 # Select Destination
                 await page.select_option('select[name="pa_arrival-location"]', dest['value'])
@@ -179,7 +173,6 @@ async def scrape_k9_jets(page):
                 months = await get_dropdown_options(page, 'select[name="pa_flight-month"]')
                 
                 if not months:
-                    # If valid route but no dates (e.g. sold out year), just skip
                     continue
 
                 for month in months:
@@ -197,7 +190,6 @@ async def scrape_k9_jets(page):
                     # Scrape Cards
                     cards = await page.locator("article.elementor-post").all()
                     
-                    # Log finding
                     if len(cards) > 0:
                          print(f"         📅 {month['label']}: Found {len(cards)} flights")
                     
@@ -207,12 +199,10 @@ async def scrape_k9_jets(page):
                             if await date_el.count() == 0: continue
                             raw_date = await date_el.inner_text()
                             
-                            route_el = card.locator(".elementor-icon-box-description").first
-                            if await route_el.count() > 0:
-                                raw_text = await route_el.inner_text()
-                                clean_route = re.sub(r"\s+(?:-|–|to)\s+", " -> ", raw_text, flags=re.IGNORECASE).strip()
-                            else:
-                                clean_route = f"{origin['label']} -> {dest['label']}"
+                            # --- FIX 2: STANDARDIZED NAMING ---
+                            # Ignore the messy card text. Use the clean dropdown labels.
+                            # This prevents "Dubai" vs "Dubai, UAE" duplicates.
+                            clean_route = f"{origin['label']} -> {dest['label']}"
 
                             price_el = card.locator(".woocommerce-Price-amount").first
                             price_text = await price_el.inner_text() if await price_el.count() > 0 else "0"
@@ -236,8 +226,6 @@ async def scrape_k9_jets(page):
                             continue
             
             except Exception as e:
-                # If a specific route fails, log it and move to the next one
-                # print(f"      ⚠️ Skipped {dest['label']} (Page reset or stale)")
                 continue
 
     print(f"Found {len(all_flights)} TOTAL K9 flights.")        
