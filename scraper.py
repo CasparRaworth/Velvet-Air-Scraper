@@ -210,7 +210,7 @@ async def scrape_k9_jets(page):
                             route_el = card.locator(".elementor-icon-box-description").first
                             if await route_el.count() > 0:
                                 raw_text = await route_el.inner_text()
-                                clean_route = raw_text.replace(" - ", " -> ").strip()
+                                clean_route = re.sub(r"\s+(?:-|–|to)\s+", " -> ", raw_text, flags=re.IGNORECASE).strip()
                             else:
                                 clean_route = f"{origin['label']} -> {dest['label']}"
 
