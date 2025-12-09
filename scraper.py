@@ -19,7 +19,6 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def clean_price(price_str):
-    """Removes currency symbols, slashes, and returns float"""
     if not price_str: return None
     clean = re.sub(r'[^\d.]', '', price_str)
     try:
@@ -28,15 +27,26 @@ def clean_price(price_str):
         return None
 
 def clean_seats(seats_str):
-    """Extracts the first number from a string like '6 seats left'"""
     if not seats_str: return 0
     numbers = re.findall(r'\d+', seats_str)
     if numbers:
         return int(numbers[0])
     return 0
 
+async def handle_cookie_banner(page):
+    """Checks for and closes the K9 cookie banner if it exists"""
+    try:
+        # Common selectors for Complianz cookie banner (seen in your logs)
+        # We try to click "Accept" or "Dismiss"
+        banner_btn = page.locator(".cmplz-accept, .cmplz-btn.cmplz-accept")
+        if await banner_btn.count() > 0 and await banner_btn.is_visible():
+            print("   🍪 Cookie banner detected. Smashing it...")
+            await banner_btn.click()
+            await page.wait_for_timeout(1000) # Wait for animation to clear
+    except Exception as e:
+        print(f"   ⚠️ Cookie banner check failed (might not exist): {e}")
+
 async def get_dropdown_options(page, selector):
-    """Helper to get value/label pairs from a dropdown"""
     try:
         await page.wait_for_selector(f"{selector} option", timeout=5000)
     except:
@@ -54,7 +64,9 @@ async def scrape_bark_air(page):
     print("🐶 Scraping Bark Air (Direct URL Mode)...")
     
     cities = [
-        "London", "New York", "Los Angeles", "Paris", "San Francisco", "Madrid", "Seattle", "Honolulu", "Lisbon", "Kailua-Kona"
+        "London", "New York", "Los Angeles", "Paris", 
+        "San Francisco", "Madrid", "Seattle", "Honolulu", 
+        "Lisbon", "Kailua-Kona"
     ]
     
     all_flights = []
@@ -110,10 +122,17 @@ async def scrape_bark_air(page):
     return all_flights
 
 async def scrape_k9_jets(page):
-    print("✈️ Scraping K9 Jets (Reset & Retry Strategy)...")
+    print("✈️ Scraping K9 Jets (Nuclear Reload + Cookie Killer)...")
     
     await page.goto("https://www.k9jets.com/routes/", timeout=60000) 
-    await page.wait_for_timeout(5000)
+    
+    # 1. Kill Cookies immediately on load
+    await handle_cookie_banner(page)
+    
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10000)
+    except:
+        pass
     
     origins = await get_dropdown_options(page, 'select[name="pa_departure-location"]')
     print(f"   Found {len(origins)} Origins to scan.")
@@ -124,28 +143,30 @@ async def scrape_k9_jets(page):
         print(f"   📍 Scanning Origin: {origin['label']}...")
         
         try:
-            # FIX 1: Click the "Reset" button (Refresh Icon) to clear state
-            reset_btn = page.locator('.jet-remove-all-filters__button')
-            if await reset_btn.is_visible():
-                await reset_btn.click()
-                await page.wait_for_timeout(2000) # Wait for clear
+            # RELOAD page to clear "sticky" defaults
+            await page.goto("https://www.k9jets.com/routes/", timeout=60000)
             
-            # Select Origin
+            # Kill Cookies AGAIN (they might reappear after reload)
+            await handle_cookie_banner(page)
+            
+            # Toggle Origin (Empty -> Real)
+            await page.select_option('select[name="pa_departure-location"]', "")
+            await page.wait_for_timeout(500)
             await page.select_option('select[name="pa_departure-location"]', origin['value'])
             
-            # FIX 2: RETRY LOOP for Destinations
-            # We check 5 times (total 5 seconds) to see if destinations appear
-            dests = []
-            for _ in range(5):
-                dests = await get_dropdown_options(page, 'select[name="pa_arrival-location"]')
-                # If we found valid destinations (more than just placeholder), break loop
-                if len(dests) > 0 and dests[0]['value'] != "":
-                    break
-                await page.wait_for_timeout(1000)
+            # FIX: Wait specifically for the Destination dropdown to have items
+            # The placeholder is 1 item. We wait for length > 1.
+            print("      Waiting for destinations to load...")
+            try:
+                await page.wait_for_function(
+                    "document.querySelectorAll('select[name=\"pa_arrival-location\"] option').length > 1",
+                    timeout=10000 # Give it 10 seconds to load
+                )
+            except:
+                print(f"      ⚠️ Timeout: Destinations never loaded for {origin['label']}")
+                continue # Skip this origin if it fails
             
-            if not dests:
-                print(f"      ⚠️ No destinations found for {origin['label']} (Skipping)")
-                continue
+            dests = await get_dropdown_options(page, 'select[name="pa_arrival-location"]')
             
             for dest in dests:
                 if dest['value'] == "" or "flying to" in dest['label'].lower(): continue
@@ -153,25 +174,22 @@ async def scrape_k9_jets(page):
                 print(f"      ↳ Dest: {dest['label']}")
                 
                 try:
-                    # Re-assert selections to keep session alive
+                    # Re-assert selections
                     await page.select_option('select[name="pa_departure-location"]', origin['value'])
                     await page.wait_for_timeout(200)
                     await page.select_option('select[name="pa_arrival-location"]', dest['value'])
-                    await page.wait_for_timeout(1000)
+                    await page.wait_for_timeout(500)
                     
-                    # Get Months (Retry loop here too)
-                    months = []
-                    for _ in range(3):
-                        months = await get_dropdown_options(page, 'select[name="pa_flight-month"]')
-                        if len(months) > 0: break
-                        await page.wait_for_timeout(500)
-                        
+                    months = await get_dropdown_options(page, 'select[name="pa_flight-month"]')
                     if not months: continue
 
                     for month in months:
                         await page.select_option('select[name="pa_flight-month"]', month['value'])
                         
                         search_btn = page.locator('.apply-filters__button')
+                        # Ensure cookie banner isn't covering the search button
+                        await handle_cookie_banner(page) 
+                        
                         if await search_btn.is_visible():
                             await search_btn.click()
                             await page.wait_for_timeout(3000)
