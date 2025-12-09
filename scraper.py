@@ -123,112 +123,150 @@ async def scrape_bark_air(page):
     return all_flights
 
 async def scrape_k9_jets(page):
-    print("✈️ Scraping K9 Jets (Nuclear Reload + Cookie Killer)...")
+    """
+    K9 Jets scraper using a hybrid approach:
+    1. Try direct URL construction with filter parameters
+    2. Fallback to scraping all visible flights and parsing route from text
+    """
+    print("✈️ Scraping K9 Jets (Direct URL + All Flights Approach)...")
     
-    await page.goto("https://www.k9jets.com/routes/", timeout=60000) 
-    
-    # 1. Kill Cookies immediately on load
-    await handle_cookie_banner(page)
-    
-    # Wait for network idle to ensure dropdowns are populated
-    try:
-        await page.wait_for_load_state("networkidle", timeout=10000)
-    except:
-        pass
-    
-    origins = await get_dropdown_options(page, 'select[name="pa_departure-location"]')
-    print(f"   Found {len(origins)} Origins to scan.")
-
     all_flights = []
-
+    
+    # STRATEGY 1: Get all dropdown combinations and try direct URLs
+    print("   📋 Strategy 1: Attempting filter combinations via URL...")
+    
+    await page.goto("https://www.k9jets.com/routes/", timeout=60000)
+    await handle_cookie_banner(page)
+    await page.wait_for_timeout(2000)
+    
+    # Get all possible filter values from the page
+    origins = await get_dropdown_options(page, 'select[name="pa_departure-location"]')
+    destinations = await get_dropdown_options(page, 'select[name="pa_arrival-location"]')
+    months = await get_dropdown_options(page, 'select[name="pa_flight-month"]')
+    
+    print(f"   Found {len(origins)} origins, {len(destinations)} destinations, {len(months)} months")
+    
+    # Try each combination via URL parameters
+    tested_combinations = 0
     for origin in origins:
-        print(f"   📍 Scanning Origin: {origin['label']}...")
-        
-        try:
-            # RELOAD page to clear "sticky" defaults
-            await page.goto("https://www.k9jets.com/routes/", timeout=60000)
+        for dest in destinations:
+            if origin['value'] == "" or dest['value'] == "": continue
+            if "flying from" in origin['label'].lower() or "flying to" in dest['label'].lower(): continue
             
-            # Kill Cookies AGAIN (they reappear after reload)
-            await handle_cookie_banner(page)
+            # K9 Jets uses WooCommerce variation attributes in URLs
+            # Format: ?filter_departure-location=london-uk&filter_arrival-location=new-jersey-us
+            url = f"https://www.k9jets.com/routes/?filter_departure-location={origin['value']}&filter_arrival-location={dest['value']}"
             
-            # Toggle Origin (Empty -> Real) to force "Change" event
-            await page.select_option('select[name="pa_departure-location"]', "")
-            await page.wait_for_timeout(500)
-            await page.select_option('select[name="pa_departure-location"]', origin['value'])
-            
-            # FIX: Wait specifically for the Destination dropdown to have items
-            # The placeholder is 1 item. We wait for length > 1.
-            print("      Waiting for destinations to load...")
             try:
-                await page.wait_for_function(
-                    "document.querySelectorAll('select[name=\"pa_arrival-location\"] option').length > 1",
-                    timeout=10000 # Give it 10 seconds to load
-                )
-            except:
-                print(f"      ⚠️ Timeout: Destinations never loaded for {origin['label']}")
-                continue # Skip this origin if it fails
-            
-            dests = await get_dropdown_options(page, 'select[name="pa_arrival-location"]')
-            
-            for dest in dests:
-                if dest['value'] == "" or "flying to" in dest['label'].lower(): continue
+                await page.goto(url, timeout=15000)
+                await page.wait_for_timeout(1500)
                 
-                print(f"      ↳ Dest: {dest['label']}")
-                
-                try:
-                    # Re-assert selections
-                    await page.select_option('select[name="pa_departure-location"]', origin['value'])
-                    await page.wait_for_timeout(200)
-                    await page.select_option('select[name="pa_arrival-location"]', dest['value'])
-                    await page.wait_for_timeout(500)
+                cards = await page.locator("article.elementor-post").all()
+                if len(cards) > 0:
+                    tested_combinations += 1
+                    print(f"   ✅ {origin['label']} → {dest['label']}: {len(cards)} flights")
                     
-                    months = await get_dropdown_options(page, 'select[name="pa_flight-month"]')
-                    if not months: continue
-
-                    for month in months:
-                        await page.select_option('select[name="pa_flight-month"]', month['value'])
-                        
-                        search_btn = page.locator('.apply-filters__button')
-                        # Ensure cookie banner isn't covering the search button
-                        await handle_cookie_banner(page) 
-                        
-                        if await search_btn.is_visible():
-                            await search_btn.click()
-                            await page.wait_for_timeout(3000)
-                        
-                        cards = await page.locator("article.elementor-post").all()
-                        
-                        if len(cards) > 0:
-                            print(f"         📅 {month['label']}: Found {len(cards)} flights")
-                        
-                        for card in cards:
-                            try:
-                                date_el = card.locator(".elementor-icon-box-title")
-                                if await date_el.count() == 0: continue
-                                raw_date = await date_el.inner_text()
-                                
-                                price_el = card.locator(".woocommerce-Price-amount").first
-                                price_text = await price_el.inner_text() if await price_el.count() > 0 else "0"
-                                
-                                seats_el = card.locator(".stock").first
-                                seats_text = await seats_el.inner_text() if await seats_el.count() > 0 else "0"
-                                
-                                all_flights.append({
-                                    "competitor": "K9 Jets",
-                                    "date": raw_date.strip(),
-                                    "route": f"{origin['label']} -> {dest['label']}", 
-                                    "operator": "Pegasus/AirX", 
-                                    "price": clean_price(price_text),
-                                    "seats": clean_seats(seats_text),
-                                    "status": "Available" if clean_seats(seats_text) > 0 else "Sold Out"
-                                })
-                            except:
-                                continue
-                except:
-                    continue
-        except Exception as e:
-            print(f"      ⚠️ Error scanning origin {origin['label']}: {e}")
-            continue
+                    for card in cards:
+                        try:
+                            # Extract date
+                            date_el = card.locator(".elementor-icon-box-title")
+                            if await date_el.count() == 0: continue
+                            raw_date = await date_el.inner_text()
+                            
+                            # Extract route from card description
+                            route_el = card.locator(".elementor-icon-box-description")
+                            route_text = await route_el.inner_text() if await route_el.count() > 0 else ""
+                            
+                            # Extract price
+                            price_el = card.locator(".woocommerce-Price-amount").first
+                            price_text = await price_el.inner_text() if await price_el.count() > 0 else "0"
+                            
+                            # Extract seats
+                            seats_el = card.locator(".stock").first
+                            seats_text = await seats_el.inner_text() if await seats_el.count() > 0 else "0"
+                            
+                            # Extract operator (if available)
+                            operator_el = card.locator("p.elementor-heading-title")
+                            operator_text = "Unknown"
+                            for i in range(await operator_el.count()):
+                                text = await operator_el.nth(i).inner_text()
+                                if "Operator:" in text:
+                                    operator_text = text.replace("Operator:", "").strip()
+                                    break
+                            
+                            all_flights.append({
+                                "competitor": "K9 Jets",
+                                "date": raw_date.strip(),
+                                "route": route_text.strip() if route_text else f"{origin['label']} -> {dest['label']}", 
+                                "operator": operator_text,
+                                "price": clean_price(price_text),
+                                "seats": clean_seats(seats_text),
+                                "status": "Available" if clean_seats(seats_text) > 0 else "Sold Out"
+                            })
+                        except:
+                            continue
+            except:
+                continue
+            
+            # Rate limiting
+            if tested_combinations % 10 == 0:
+                await page.wait_for_timeout(1000)
+    
+    # STRATEGY 2: If Strategy 1 found nothing, scrape everything visible on main page
+    if len(all_flights) == 0:
+        print("   📋 Strategy 2: Scraping all visible flights from main page...")
+        
+        await page.goto("https://www.k9jets.com/routes/", timeout=60000)
+        await handle_cookie_banner(page)
+        await page.wait_for_timeout(2000)
+        
+        # Scroll to load lazy-loaded content
+        for _ in range(5):
+            await page.evaluate("window.scrollBy(0, window.innerHeight)")
+            await page.wait_for_timeout(500)
+        
+        cards = await page.locator("article.elementor-post").all()
+        print(f"   Found {len(cards)} total visible flight cards")
+        
+        for card in cards:
+            try:
+                # Extract date
+                date_el = card.locator(".elementor-icon-box-title")
+                if await date_el.count() == 0: continue
+                raw_date = await date_el.inner_text()
+                
+                # Extract route
+                route_el = card.locator(".elementor-icon-box-description")
+                route_text = await route_el.inner_text() if await route_el.count() > 0 else "Unknown Route"
+                
+                # Extract price
+                price_el = card.locator(".woocommerce-Price-amount").first
+                price_text = await price_el.inner_text() if await price_el.count() > 0 else "0"
+                
+                # Extract seats
+                seats_el = card.locator(".stock").first
+                seats_text = await seats_el.inner_text() if await seats_el.count() > 0 else "0"
+                
+                # Extract operator
+                operator_el = card.locator("p.elementor-heading-title")
+                operator_text = "Unknown"
+                for i in range(await operator_el.count()):
+                    text = await operator_el.nth(i).inner_text()
+                    if "Operator:" in text:
+                        operator_text = text.replace("Operator:", "").strip()
+                        break
+                
+                all_flights.append({
+                    "competitor": "K9 Jets",
+                    "date": raw_date.strip(),
+                    "route": route_text.strip(),
+                    "operator": operator_text,
+                    "price": clean_price(price_text),
+                    "seats": clean_seats(seats_text),
+                    "status": "Available" if clean_seats(seats_text) > 0 else "Sold Out"
+                })
+            except Exception as e:
+                continue
 
     print(f"Found {len(all_flights)} TOTAL K9 flights.")        
     return all_flights
