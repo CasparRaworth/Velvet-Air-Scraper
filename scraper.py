@@ -124,151 +124,114 @@ async def scrape_bark_air(page):
 
 async def scrape_k9_jets(page):
     """
-    K9 Jets scraper using a hybrid approach:
-    1. Try direct URL construction with filter parameters
-    2. Fallback to scraping all visible flights and parsing route from text
+    K9 Jets scraper using enhanced "scrape all visible" strategy with infinite scroll.
+    Since the AJAX dropdowns don't populate reliably in headless mode,
+    we scrape ALL flights from the main page with aggressive scrolling.
     """
-    print("✈️ Scraping K9 Jets (Direct URL + All Flights Approach)...")
+    print("✈️ Scraping K9 Jets (Enhanced All-Flights Strategy)...")
     
     all_flights = []
-    
-    # STRATEGY 1: Get all dropdown combinations and try direct URLs
-    print("   📋 Strategy 1: Attempting filter combinations via URL...")
+    seen_flights = set()
     
     await page.goto("https://www.k9jets.com/routes/", timeout=60000)
     await handle_cookie_banner(page)
+    await page.wait_for_load_state("domcontentloaded")
     await page.wait_for_timeout(2000)
     
-    # Get all possible filter values from the page
-    origins = await get_dropdown_options(page, 'select[name="pa_departure-location"]')
-    destinations = await get_dropdown_options(page, 'select[name="pa_arrival-location"]')
-    months = await get_dropdown_options(page, 'select[name="pa_flight-month"]')
+    print("   📜 Scrolling to load all flights (lazy loading)...")
     
-    print(f"   Found {len(origins)} origins, {len(destinations)} destinations, {len(months)} months")
+    # Aggressive infinite scroll to load ALL flights
+    previous_count = 0
+    no_change_count = 0
+    scroll_attempts = 0
+    max_scrolls = 50  # Safety limit
     
-    # Try each combination via URL parameters
-    tested_combinations = 0
-    for origin in origins:
-        for dest in destinations:
-            if origin['value'] == "" or dest['value'] == "": continue
-            if "flying from" in origin['label'].lower() or "flying to" in dest['label'].lower(): continue
+    while scroll_attempts < max_scrolls:
+        # Get current count
+        current_count = await page.locator("article.elementor-post").count()
+        
+        # Scroll to bottom
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(1500)  # Wait for lazy load
+        
+        # Scroll back up a bit (sometimes triggers more loading)
+        await page.evaluate("window.scrollBy(0, -500)")
+        await page.wait_for_timeout(500)
+        
+        # Check if new flights loaded
+        if current_count == previous_count:
+            no_change_count += 1
+            if no_change_count >= 3:
+                # No new flights after 3 scroll attempts
+                print(f"   ✅ Loaded all available flights (stopped at {current_count})")
+                break
+        else:
+            print(f"      → Loaded {current_count} flights so far...")
+            no_change_count = 0
+        
+        previous_count = current_count
+        scroll_attempts += 1
+    
+    # Final scroll to top to ensure everything is in DOM
+    await page.evaluate("window.scrollTo(0, 0)")
+    await page.wait_for_timeout(1000)
+    
+    # Now scrape all visible cards
+    cards = await page.locator("article.elementor-post").all()
+    print(f"   📦 Scraping {len(cards)} total flight cards...")
+    
+    for idx, card in enumerate(cards):
+        try:
+            # Extract date
+            date_el = card.locator(".elementor-icon-box-title")
+            if await date_el.count() == 0: continue
+            raw_date = await date_el.inner_text()
             
-            # K9 Jets uses WooCommerce variation attributes in URLs
-            # Format: ?filter_departure-location=london-uk&filter_arrival-location=new-jersey-us
-            url = f"https://www.k9jets.com/routes/?filter_departure-location={origin['value']}&filter_arrival-location={dest['value']}"
+            # Extract route
+            route_el = card.locator(".elementor-icon-box-description")
+            route_text = await route_el.inner_text() if await route_el.count() > 0 else "Unknown Route"
             
-            try:
-                await page.goto(url, timeout=15000)
-                await page.wait_for_timeout(1500)
-                
-                cards = await page.locator("article.elementor-post").all()
-                if len(cards) > 0:
-                    tested_combinations += 1
-                    print(f"   ✅ {origin['label']} → {dest['label']}: {len(cards)} flights")
-                    
-                    for card in cards:
-                        try:
-                            # Extract date
-                            date_el = card.locator(".elementor-icon-box-title")
-                            if await date_el.count() == 0: continue
-                            raw_date = await date_el.inner_text()
-                            
-                            # Extract route from card description
-                            route_el = card.locator(".elementor-icon-box-description")
-                            route_text = await route_el.inner_text() if await route_el.count() > 0 else ""
-                            
-                            # Extract price
-                            price_el = card.locator(".woocommerce-Price-amount").first
-                            price_text = await price_el.inner_text() if await price_el.count() > 0 else "0"
-                            
-                            # Extract seats
-                            seats_el = card.locator(".stock").first
-                            seats_text = await seats_el.inner_text() if await seats_el.count() > 0 else "0"
-                            
-                            # Extract operator (if available)
-                            operator_el = card.locator("p.elementor-heading-title")
-                            operator_text = "Unknown"
-                            for i in range(await operator_el.count()):
-                                text = await operator_el.nth(i).inner_text()
-                                if "Operator:" in text:
-                                    operator_text = text.replace("Operator:", "").strip()
-                                    break
-                            
-                            all_flights.append({
-                                "competitor": "K9 Jets",
-                                "date": raw_date.strip(),
-                                "route": route_text.strip() if route_text else f"{origin['label']} -> {dest['label']}", 
-                                "operator": operator_text,
-                                "price": clean_price(price_text),
-                                "seats": clean_seats(seats_text),
-                                "status": "Available" if clean_seats(seats_text) > 0 else "Sold Out"
-                            })
-                        except:
-                            continue
-            except:
+            # Prevent duplicates
+            flight_key = f"{raw_date}|{route_text}"
+            if flight_key in seen_flights:
                 continue
+            seen_flights.add(flight_key)
             
-            # Rate limiting
-            if tested_combinations % 10 == 0:
-                await page.wait_for_timeout(1000)
+            # Extract price
+            price_el = card.locator(".woocommerce-Price-amount").first
+            price_text = await price_el.inner_text() if await price_el.count() > 0 else "0"
+            
+            # Extract seats
+            seats_el = card.locator(".stock").first
+            seats_text = await seats_el.inner_text() if await seats_el.count() > 0 else "0"
+            
+            # Extract operator
+            operator_el = card.locator("p.elementor-heading-title")
+            operator_text = "Unknown"
+            for i in range(await operator_el.count()):
+                text = await operator_el.nth(i).inner_text()
+                if "Operator:" in text:
+                    operator_text = text.replace("Operator:", "").strip()
+                    break
+            
+            all_flights.append({
+                "competitor": "K9 Jets",
+                "date": raw_date.strip(),
+                "route": route_text.strip(),
+                "operator": operator_text,
+                "price": clean_price(price_text),
+                "seats": clean_seats(seats_text),
+                "status": "Available" if clean_seats(seats_text) > 0 else "Sold Out"
+            })
+            
+            # Progress indicator every 20 flights
+            if (idx + 1) % 20 == 0:
+                print(f"      → Processed {idx + 1}/{len(cards)} flights...")
+                
+        except Exception as e:
+            continue
     
-    # STRATEGY 2: If Strategy 1 found nothing, scrape everything visible on main page
-    if len(all_flights) == 0:
-        print("   📋 Strategy 2: Scraping all visible flights from main page...")
-        
-        await page.goto("https://www.k9jets.com/routes/", timeout=60000)
-        await handle_cookie_banner(page)
-        await page.wait_for_timeout(2000)
-        
-        # Scroll to load lazy-loaded content
-        for _ in range(5):
-            await page.evaluate("window.scrollBy(0, window.innerHeight)")
-            await page.wait_for_timeout(500)
-        
-        cards = await page.locator("article.elementor-post").all()
-        print(f"   Found {len(cards)} total visible flight cards")
-        
-        for card in cards:
-            try:
-                # Extract date
-                date_el = card.locator(".elementor-icon-box-title")
-                if await date_el.count() == 0: continue
-                raw_date = await date_el.inner_text()
-                
-                # Extract route
-                route_el = card.locator(".elementor-icon-box-description")
-                route_text = await route_el.inner_text() if await route_el.count() > 0 else "Unknown Route"
-                
-                # Extract price
-                price_el = card.locator(".woocommerce-Price-amount").first
-                price_text = await price_el.inner_text() if await price_el.count() > 0 else "0"
-                
-                # Extract seats
-                seats_el = card.locator(".stock").first
-                seats_text = await seats_el.inner_text() if await seats_el.count() > 0 else "0"
-                
-                # Extract operator
-                operator_el = card.locator("p.elementor-heading-title")
-                operator_text = "Unknown"
-                for i in range(await operator_el.count()):
-                    text = await operator_el.nth(i).inner_text()
-                    if "Operator:" in text:
-                        operator_text = text.replace("Operator:", "").strip()
-                        break
-                
-                all_flights.append({
-                    "competitor": "K9 Jets",
-                    "date": raw_date.strip(),
-                    "route": route_text.strip(),
-                    "operator": operator_text,
-                    "price": clean_price(price_text),
-                    "seats": clean_seats(seats_text),
-                    "status": "Available" if clean_seats(seats_text) > 0 else "Sold Out"
-                })
-            except Exception as e:
-                continue
-
-    print(f"Found {len(all_flights)} TOTAL K9 flights.")        
+    print(f"Found {len(all_flights)} TOTAL K9 flights (after deduplication).")
     return all_flights
 
 async def save_to_supabase(data):
