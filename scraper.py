@@ -36,15 +36,16 @@ def clean_seats(seats_str):
 async def handle_cookie_banner(page):
     """Checks for and closes the K9 cookie banner if it exists"""
     try:
-        # Common selectors for Complianz cookie banner (seen in your logs)
-        # We try to click "Accept" or "Dismiss"
-        banner_btn = page.locator(".cmplz-accept, .cmplz-btn.cmplz-accept")
+        # Try multiple common selectors for the "Accept" button
+        # The logs suggest a 'cmplz' (Complianz) banner
+        banner_btn = page.locator(".cmplz-accept, .cmplz-btn.cmplz-accept, #ucc-c-btn")
         if await banner_btn.count() > 0 and await banner_btn.is_visible():
             print("   🍪 Cookie banner detected. Smashing it...")
-            await banner_btn.click()
+            await banner_btn.first.click()
             await page.wait_for_timeout(1000) # Wait for animation to clear
     except Exception as e:
-        print(f"   ⚠️ Cookie banner check failed (might not exist): {e}")
+        # It's okay if we don't find it, maybe it's already gone
+        pass
 
 async def get_dropdown_options(page, selector):
     try:
@@ -129,6 +130,7 @@ async def scrape_k9_jets(page):
     # 1. Kill Cookies immediately on load
     await handle_cookie_banner(page)
     
+    # Wait for network idle to ensure dropdowns are populated
     try:
         await page.wait_for_load_state("networkidle", timeout=10000)
     except:
@@ -146,10 +148,10 @@ async def scrape_k9_jets(page):
             # RELOAD page to clear "sticky" defaults
             await page.goto("https://www.k9jets.com/routes/", timeout=60000)
             
-            # Kill Cookies AGAIN (they might reappear after reload)
+            # Kill Cookies AGAIN (they reappear after reload)
             await handle_cookie_banner(page)
             
-            # Toggle Origin (Empty -> Real)
+            # Toggle Origin (Empty -> Real) to force "Change" event
             await page.select_option('select[name="pa_departure-location"]', "")
             await page.wait_for_timeout(500)
             await page.select_option('select[name="pa_departure-location"]', origin['value'])
