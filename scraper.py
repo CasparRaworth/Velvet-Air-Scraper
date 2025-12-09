@@ -562,22 +562,36 @@ async def save_to_supabase(data):
         except:
             continue
 
-        # Parse origin / destination from the route string
-        route_str = item.get("route", "").strip()
+        # --- Parse origin / destination from the route string ---
+        route_str = (item.get("route") or "").strip()
+        origin = route_str
+        destination = route_str
+
         if "->" in route_str:
+            # Pattern: "London, UK -> London, UK - Van Nuys, California"
             left, right = route_str.split("->", 1)
             origin = left.strip()
             dest_raw = right.strip()
-            # K9 routes often look like "London, UK - Van Nuys, California"
-            # In that case we only want the final destination after the last " - "
-            if " - " in dest_raw:
-                destination = dest_raw.split(" - ")[-1].strip()
+        elif re.search(r"\s+to\s+", route_str, flags=re.IGNORECASE):
+            # Pattern: "Teterboro, New Jersey to Dubai, UAE"
+            parts = re.split(r"\s+to\s+", route_str, maxsplit=1, flags=re.IGNORECASE)
+            if len(parts) == 2:
+                origin, dest_raw = parts[0].strip(), parts[1].strip()
             else:
-                destination = dest_raw
+                dest_raw = route_str
+        elif " - " in route_str:
+            # Pattern: "London, UK - Van Nuys, California"
+            left, right = route_str.split(" - ", 1)
+            origin, dest_raw = left.strip(), right.strip()
         else:
-            # Fallback: treat the whole string as both origin and destination
-            origin = route_str
-            destination = route_str
+            dest_raw = route_str
+
+        # If destination part still contains extra leg info ("London, UK - Van Nuys, California"),
+        # keep only the final city after the last " - ".
+        if " - " in dest_raw:
+            destination = dest_raw.split(" - ")[-1].strip()
+        else:
+            destination = dest_raw
 
         flight_payload = {
             "competitor": item['competitor'],
