@@ -11,7 +11,7 @@ load_dotenv()
 
 # --- CONFIGURATION ---
 # (Ideally, keep these in your .env file, but this works for now)
-SUPABASE_URL = os.getenv("SUPABASE_URL", "https://jletfmpkwuoouspqwvqi.supabase.co")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "your_key_here") 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
