@@ -76,28 +76,52 @@ async def _fetch_k9_detail_page(client: httpx.AsyncClient, url: str) -> dict:
     """
     Fetch a single K9 product /flight/ page and extract authoritative price
     and seats/status using the markup you provided.
+
+    The K9 price HTML looks like:
+      <span class="woocommerce-Price-amount amount">
+        <bdi><span class="woocommerce-Price-currencySymbol">$</span>7,925.00</bdi>
+      </span>
     """
     try:
         resp = await client.get(url)
         resp.raise_for_status()
-    except Exception:
+    except Exception as e:
+        print(f"      ⚠️ Failed to fetch detail page {url}: {e}")
         return {}
 
     html_text = resp.text
 
-    price_regex = re.compile(
-        r'class="[^"]*woocommerce-Price-amount[^"]*"[^>]*>(.*?)</', re.I | re.S
+    # Approach 1: Extract content inside <bdi> tags within woocommerce-Price-amount
+    # This captures "$7,925.00" as the full text content
+    bdi_regex = re.compile(
+        r'class="[^"]*woocommerce-Price-amount[^"]*"[^>]*>\s*<bdi[^>]*>(.*?)</bdi>',
+        re.I | re.S,
     )
 
-    # Collect all price spans and take the maximum numeric value.
+    # Approach 2 (fallback): Find all dollar amounts directly in the text
+    # Matches patterns like $7,925.00 or $36.00
+    dollar_regex = re.compile(r'\$[\d,]+\.?\d*')
+
     price_value: float | None = None
-    all_matches = price_regex.findall(html_text)
     candidates: list[float] = []
-    for m in all_matches:
-        raw_price = _strip_html(m)
+
+    # Try the structured approach first
+    for bdi_match in bdi_regex.findall(html_text):
+        raw_price = _strip_html(bdi_match)
+        # CRITICAL: Unescape HTML entities like &#036; -> $ before parsing
+        # Otherwise "&#036;8,925.00" becomes "0368925" when non-digits are stripped
+        raw_price = html_lib.unescape(raw_price)
         val = clean_price(raw_price)
-        if val is not None:
+        if val is not None and val > 100:  # Filter out small fees
             candidates.append(val)
+
+    # If no luck, try direct dollar amount extraction
+    if not candidates:
+        for dollar_match in dollar_regex.findall(html_text):
+            val = clean_price(dollar_match)
+            if val is not None and val > 100:  # Filter out small fees like $36
+                candidates.append(val)
+
     if candidates:
         price_value = max(candidates)
 
@@ -655,7 +679,9 @@ async def scrape_k9_jets_http() -> list[dict]:
             for f in flights:
                 # Ensure route has a sensible format; if not, prefix origin.
                 route = f.get("route") or "Unknown Route"
-                if "->" not in route and " to " not in route.lower():
+                if "->" not in route and " to " not in route.lower() and " - " not in route:
+                    # Route is just a city name - assume it's the destination
+                    # and add origin as prefix
                     route = f"{origin_label} -> {route}"
                     f["route"] = route
 
