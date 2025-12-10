@@ -1,7 +1,8 @@
 import asyncio
+import os
 import re
 from datetime import datetime
-import os
+import html as html_lib
 
 import httpx
 from dateutil import parser
@@ -34,6 +35,95 @@ def clean_seats(seats_str):
     if numbers:
         return int(numbers[0])
     return 0
+
+
+def split_route(route_str: str) -> tuple[str, str]:
+    """
+    Split a human‑readable route string into (origin, destination).
+
+    Handles formats like:
+      - "London, UK - Teterboro, NJ"
+      - "Teterboro, New Jersey to Dubai, UAE"
+      - "Teterboro, New Jersey – Dubai, UAE"
+
+    If we can't confidently split, we return (route_str, route_str) so you can
+    see the raw value and adjust the parser later.
+    """
+    if not route_str:
+        return "", ""
+
+    txt = route_str.strip()
+
+    # Try explicit " to " first (e.g. "Teterboro, New Jersey to Dubai, UAE")
+    if re.search(r"\s+to\s+", txt, flags=re.IGNORECASE):
+        parts = re.split(r"\s+to\s+", txt, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 2:
+            return parts[0].strip(), parts[1].strip()
+
+    # Then try common dash / arrow separators
+    for sep in [" - ", " – ", " — ", "->", "→"]:
+        if sep in txt:
+            parts = [p.strip() for p in txt.split(sep) if p.strip()]
+            if len(parts) >= 2:
+                # Use first part as origin, last part as final destination
+                return parts[0], parts[-1]
+
+    # Fallback: couldn't split, treat whole string as both origin and destination
+    return txt, txt
+
+
+async def _fetch_k9_detail_page(client: httpx.AsyncClient, url: str) -> dict:
+    """
+    Fetch a single K9 product /flight/ page and extract authoritative price
+    and seats/status using the markup you provided.
+    """
+    try:
+        resp = await client.get(url)
+        resp.raise_for_status()
+    except Exception:
+        return {}
+
+    html_text = resp.text
+
+    price_regex = re.compile(
+        r'class="[^"]*woocommerce-Price-amount[^"]*"[^>]*>(.*?)</', re.I | re.S
+    )
+
+    # Collect all price spans and take the maximum numeric value.
+    price_value: float | None = None
+    all_matches = price_regex.findall(html_text)
+    candidates: list[float] = []
+    for m in all_matches:
+        raw_price = _strip_html(m)
+        val = clean_price(raw_price)
+        if val is not None:
+            candidates.append(val)
+    if candidates:
+        price_value = max(candidates)
+
+    # Seats / status: <p class="stock in-stock">6 Seats Available</p>
+    seats_p_regex = re.compile(
+        r'<p[^>]*class="[^"]*stock[^"]*"[^>]*>(.*?)</p>', re.I | re.S
+    )
+    seats_match = seats_p_regex.search(html_text)
+    seats_text = _strip_html(seats_match.group(1)) if seats_match else ""
+
+    seats_value = clean_seats(seats_text) if seats_text else None
+    seats_lower = seats_text.lower()
+    if "sold out" in seats_lower:
+        status = "Sold Out"
+        seats_value = None
+    elif seats_value is not None and seats_value > 0:
+        status = "Available"
+    else:
+        status = "Available"
+
+    out: dict = {}
+    if price_value is not None:
+        out["price"] = price_value
+    out["seats"] = seats_value
+    out["status"] = status
+    return out
 
 
 def _strip_html(text: str) -> str:
@@ -88,8 +178,13 @@ def _extract_k9_flights_from_html(html: str) -> list[dict]:
     seats_regex = re.compile(
         r'class="[^"]*stock[^"]*"[^>]*>(.*?)</', re.I | re.S
     )
-    operator_regex = re.compile(
+    heading_p_regex = re.compile(
         r'<p[^>]*class="[^"]*elementor-heading-title[^"]*"[^>]*>(.*?)</p>',
+        re.I | re.S,
+    )
+    # Detail URL (book / waitlist button)
+    url_regex = re.compile(
+        r'<a[^>]*class="[^"]*elementor-button[^"]*"[^>]*href="([^"]+/flight/[^"]+)"',
         re.I | re.S,
     )
 
@@ -101,25 +196,53 @@ def _extract_k9_flights_from_html(html: str) -> list[dict]:
         if not raw_date:
             continue
 
+        # Route
         route_match = route_regex.search(article_html)
         raw_route = (
             _strip_html(route_match.group(1)) if route_match else "Unknown Route"
         )
 
-        price_match = price_regex.search(article_html)
-        raw_price = _strip_html(price_match.group(1)) if price_match else "0"
-
+        # Seats & status from stock text
         seats_match = seats_regex.search(article_html)
-        raw_seats = _strip_html(seats_match.group(1)) if seats_match else "0"
+        seats_text = _strip_html(seats_match.group(1)) if seats_match else ""
 
-        operator_match = operator_regex.search(article_html)
+        seats_value = clean_seats(seats_text) if seats_text else None
+        seats_lower = seats_text.lower()
+        if "sold out" in seats_lower:
+            status = "Sold Out"
+            seats_value = None
+        elif seats_value is not None and seats_value > 0:
+            status = "Available"
+        else:
+            # No explicit count and not marked sold‑out – treat as unknown/available
+            status = "Available"
+            seats_value = None
+
+        # Price – leave as None here; detail page is the source of truth.
+        raw_price = None
+
+        # Operator and departure time from heading <p>s
         operator_text = "Unknown"
-        if operator_match:
-            op_raw = _strip_html(operator_match.group(1))
-            if "Operator:" in op_raw:
-                operator_text = op_raw.replace("Operator:", "").strip()
-            elif op_raw:
-                operator_text = op_raw
+        departure_time = None
+
+        for match in heading_p_regex.finditer(article_html):
+            heading_text = _strip_html(match.group(1))
+            lower = heading_text.lower()
+            if "operator:" in lower and operator_text == "Unknown":
+                # e.g. "Operator: Pegasus Elite Aviation"
+                _, _, after = heading_text.partition(":")
+                operator_text = after.strip() or operator_text
+            elif "departure time" in lower and departure_time is None:
+                # e.g. "Departure Time: 2:00 PM"
+                m_dep = re.search(r"departure time:\s*(.+)", heading_text, re.I)
+                if m_dep:
+                    departure_time = m_dep.group(1).strip()
+
+        # Detail URL (used later to refine price & seats from the product page)
+        url = None
+        url_match = url_regex.search(article_html)
+        if url_match:
+            url = html_lib.unescape(url_match.group(1))
 
         flights.append(
             {
@@ -127,9 +250,11 @@ def _extract_k9_flights_from_html(html: str) -> list[dict]:
                 "date": raw_date,
                 "route": raw_route,
                 "operator": operator_text,
-                "price": clean_price(raw_price),
-                "seats": clean_seats(raw_seats),
-                "status": "Available" if clean_seats(raw_seats) > 0 else "Sold Out",
+                "price": clean_price(raw_price) if raw_price is not None else None,
+                "seats": seats_value,
+                "status": status,
+                "departure_time": departure_time,
+                "url": url,
             }
         )
 
@@ -534,6 +659,21 @@ async def scrape_k9_jets_http() -> list[dict]:
                     route = f"{origin_label} -> {route}"
                     f["route"] = route
 
+                # If we have a detail URL, refine price & seats from the product page.
+                url = f.get("url")
+                if url:
+                    try:
+                        detail = await _fetch_k9_detail_page(client, url)
+                        if detail.get("price") is not None:
+                            f["price"] = detail["price"]
+                        if "seats" in detail:
+                            f["seats"] = detail["seats"]
+                        if "status" in detail:
+                            f["status"] = detail["status"]
+                    except Exception:
+                        # If detail fetch fails, keep the coarse values from /routes/
+                        pass
+
                 key = f"{f['date']}|{f['route']}"
                 if key in seen_keys:
                     continue
@@ -557,48 +697,36 @@ async def save_to_supabase(data):
 
     for item in clean_data:
         try:
-            dt_obj = parser.parse(item['date'])
+            # Parse date (and optional time) from scraped strings
+            dt_obj = parser.parse(str(item.get("date")))
             clean_date = dt_obj.strftime("%Y-%m-%d")
-        except:
+        except Exception:
+            # If we can't parse the date, skip this row to avoid bad data
+            print(f"   ⚠️ Skipping flight with unparseable date: {item.get('date')}")
             continue
 
+        # Optional departure time (K9 only, Bark doesn't provide it)
+        dep_time_str = item.get("departure_time")
+        clean_time = None
+        if dep_time_str:
+            try:
+                # Normalise to HH:MM:SS (24h) for Postgres TIME column
+                t = parser.parse(str(dep_time_str)).time()
+                clean_time = t.strftime("%H:%M:%S")
+            except Exception:
+                print(f"   ⚠️ Could not parse departure_time '{dep_time_str}'")
+                clean_time = None
+
         # --- Parse origin / destination from the route string ---
-        route_str = (item.get("route") or "").strip()
-        origin = route_str
-        destination = route_str
-
-        if "->" in route_str:
-            # Pattern: "London, UK -> London, UK - Van Nuys, California"
-            left, right = route_str.split("->", 1)
-            origin = left.strip()
-            dest_raw = right.strip()
-        elif re.search(r"\s+to\s+", route_str, flags=re.IGNORECASE):
-            # Pattern: "Teterboro, New Jersey to Dubai, UAE"
-            parts = re.split(r"\s+to\s+", route_str, maxsplit=1, flags=re.IGNORECASE)
-            if len(parts) == 2:
-                origin, dest_raw = parts[0].strip(), parts[1].strip()
-            else:
-                dest_raw = route_str
-        elif " - " in route_str:
-            # Pattern: "London, UK - Van Nuys, California"
-            left, right = route_str.split(" - ", 1)
-            origin, dest_raw = left.strip(), right.strip()
-        else:
-            dest_raw = route_str
-
-        # If destination part still contains extra leg info ("London, UK - Van Nuys, California"),
-        # keep only the final city after the last " - ".
-        if " - " in dest_raw:
-            destination = dest_raw.split(" - ")[-1].strip()
-        else:
-            destination = dest_raw
+        origin, destination = split_route(item.get("route", ""))
 
         flight_payload = {
-            "competitor": item['competitor'],
+            "competitor": item["competitor"],
             "origin": origin,
             "destination": destination,
             "departure_date": clean_date,
-            "operator": item.get('operator')
+            "departure_time": clean_time,
+            "operator": item.get("operator"),
         }
         
         res = supabase.table("flights").upsert(
@@ -607,11 +735,18 @@ async def save_to_supabase(data):
         
         if res.data:
             flight_id = res.data[0]["id"]
+        seats_val = item.get("seats")
+        status_val = item.get("status", "Available")
+
+        # For K9, we explicitly interpret "no numeric seats" as Sold Out.
+        if item.get("competitor") == "K9 Jets" and seats_val is None:
+            status_val = "Sold Out"
+
         snapshot_payload = {
             "flight_id": flight_id,
-                "price": item.get("price"),
-                "seats_available": item.get("seats"),
-                "status": item.get("status", "Available"),
+            "price": item.get("price"),
+            "seats_available": seats_val,
+            "status": status_val,
         }
         supabase.table("flight_snapshots").insert(snapshot_payload).execute()
 
