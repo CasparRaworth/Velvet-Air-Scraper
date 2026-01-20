@@ -72,7 +72,7 @@ def split_route(route_str: str) -> tuple[str, str]:
     return txt, txt
 
 
-async def _fetch_k9_detail_page(client: httpx.AsyncClient, url: str) -> dict:
+async def _fetch_k9_detail_page(client: httpx.AsyncClient, url: str, max_retries: int = 3) -> dict:
     """
     Fetch a single K9 product /flight/ page and extract authoritative price
     and seats/status using the markup you provided.
@@ -81,13 +81,24 @@ async def _fetch_k9_detail_page(client: httpx.AsyncClient, url: str) -> dict:
       <span class="woocommerce-Price-amount amount">
         <bdi><span class="woocommerce-Price-currencySymbol">$</span>7,925.00</bdi>
       </span>
+    
+    Includes retry logic for 502/503 server errors.
     """
-    try:
-        resp = await client.get(url)
-        resp.raise_for_status()
-    except Exception as e:
-        print(f"      ⚠️ Failed to fetch detail page {url}: {e}")
-        return {}
+    for attempt in range(max_retries):
+        try:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            break  # Success - exit retry loop
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (502, 503) and attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 2  # 2s, 4s, 6s
+                await asyncio.sleep(wait_time)
+                continue
+            print(f"      ⚠️ Failed to fetch detail page {url}: {e}")
+            return {}
+        except Exception as e:
+            print(f"      ⚠️ Failed to fetch detail page {url}: {e}")
+            return {}
 
     html_text = resp.text
 
@@ -696,6 +707,8 @@ async def scrape_k9_jets_http() -> list[dict]:
                             f["seats"] = detail["seats"]
                         if "status" in detail:
                             f["status"] = detail["status"]
+                        # Rate limit: small delay between detail page fetches
+                        await asyncio.sleep(0.3)
                     except Exception:
                         # If detail fetch fails, keep the coarse values from /routes/
                         pass
@@ -719,62 +732,75 @@ async def save_to_supabase(data):
     
     clean_data = list(unique_data.values())
     print(f"   📉 Deduplicated: Removed {len(data) - len(clean_data)} duplicate entries.")
-    print(f"   🚀 Uploading {len(clean_data)} unique snapshots to Supabase...")
+    print(f"   🚀 Uploading {len(clean_data)} unique snapshots to Supabase in batches...")
 
-    for item in clean_data:
-        try:
-            # Parse date (and optional time) from scraped strings
-            dt_obj = parser.parse(str(item.get("date")))
-            clean_date = dt_obj.strftime("%Y-%m-%d")
-        except Exception:
-            # If we can't parse the date, skip this row to avoid bad data
-            print(f"   ⚠️ Skipping flight with unparseable date: {item.get('date')}")
-            continue
-
-        # Optional departure time (K9 only, Bark doesn't provide it)
-        dep_time_str = item.get("departure_time")
-        clean_time = None
-        if dep_time_str:
+    # Process in chunks to avoid timeout
+    BATCH_SIZE = 50
+    total_batches = (len(clean_data) + BATCH_SIZE - 1) // BATCH_SIZE
+    
+    for batch_num in range(total_batches):
+        start_idx = batch_num * BATCH_SIZE
+        end_idx = min(start_idx + BATCH_SIZE, len(clean_data))
+        batch = clean_data[start_idx:end_idx]
+        
+        print(f"   📦 Processing batch {batch_num + 1}/{total_batches} ({len(batch)} records)...")
+        
+        for item in batch:
             try:
-                # Normalise to HH:MM:SS (24h) for Postgres TIME column
-                t = parser.parse(str(dep_time_str)).time()
-                clean_time = t.strftime("%H:%M:%S")
+                # Parse date (and optional time) from scraped strings
+                dt_obj = parser.parse(str(item.get("date")))
+                clean_date = dt_obj.strftime("%Y-%m-%d")
             except Exception:
-                print(f"   ⚠️ Could not parse departure_time '{dep_time_str}'")
-                clean_time = None
+                # If we can't parse the date, skip this row to avoid bad data
+                print(f"   ⚠️ Skipping flight with unparseable date: {item.get('date')}")
+                continue
 
-        # --- Parse origin / destination from the route string ---
-        origin, destination = split_route(item.get("route", ""))
+            # Optional departure time (K9 only, Bark doesn't provide it)
+            dep_time_str = item.get("departure_time")
+            clean_time = None
+            if dep_time_str:
+                try:
+                    # Normalise to HH:MM:SS (24h) for Postgres TIME column
+                    t = parser.parse(str(dep_time_str)).time()
+                    clean_time = t.strftime("%H:%M:%S")
+                except Exception:
+                    print(f"   ⚠️ Could not parse departure_time '{dep_time_str}'")
+                    clean_time = None
 
-        flight_payload = {
-            "competitor": item["competitor"],
-            "origin": origin,
-            "destination": destination,
-            "departure_date": clean_date,
-            "departure_time": clean_time,
-            "operator": item.get("operator"),
-        }
-        
-        res = supabase.table("flights").upsert(
-            flight_payload, on_conflict="competitor,origin,destination,departure_date"
-        ).execute()
-        
-        if res.data:
-            flight_id = res.data[0]["id"]
-        seats_val = item.get("seats")
-        status_val = item.get("status", "Available")
+            # --- Parse origin / destination from the route string ---
+            origin, destination = split_route(item.get("route", ""))
 
-        # For K9, we explicitly interpret "no numeric seats" as Sold Out.
-        if item.get("competitor") == "K9 Jets" and seats_val is None:
-            status_val = "Sold Out"
+            flight_payload = {
+                "competitor": item["competitor"],
+                "origin": origin,
+                "destination": destination,
+                "departure_date": clean_date,
+                "departure_time": clean_time,
+                "operator": item.get("operator"),
+            }
+            
+            res = supabase.table("flights").upsert(
+                flight_payload, on_conflict="competitor,origin,destination,departure_date"
+            ).execute()
+            
+            if res.data:
+                flight_id = res.data[0]["id"]
+            seats_val = item.get("seats")
+            status_val = item.get("status", "Available")
 
-        snapshot_payload = {
-            "flight_id": flight_id,
-            "price": item.get("price"),
-            "seats_available": seats_val,
-            "status": status_val,
-        }
-        supabase.table("flight_snapshots").insert(snapshot_payload).execute()
+            # For K9, we explicitly interpret "no numeric seats" as Sold Out.
+            if item.get("competitor") == "K9 Jets" and seats_val is None:
+                status_val = "Sold Out"
+
+            snapshot_payload = {
+                "flight_id": flight_id,
+                "price": item.get("price"),
+                "seats_available": seats_val,
+                "status": status_val,
+            }
+            supabase.table("flight_snapshots").insert(snapshot_payload).execute()
+    
+    print(f"   ✅ Successfully uploaded all {len(clean_data)} records!")
 
 async def main():
     async with async_playwright() as p:
