@@ -12,7 +12,6 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # --- CONFIG: Airport Normalization ---
-# COMPREHENSIVE MAPPING to fix K9's bad data
 AIRPORT_MAPPING = {
     # --- UK / Europe Fixes ---
     "London, UK": "London",
@@ -24,9 +23,14 @@ AIRPORT_MAPPING = {
     "Milan, Italy": "Milan",
     "Madrid, UK": "Madrid",
     "Madrid, Spain": "Madrid",
-    "Paris, France": "Paris",
+    
+    # --- THE FIX: PARIS MERGE ---
+    "Paris": "Paris (Le Bourget)",           # <--- Merged generic
+    "Paris, France": "Paris (Le Bourget)",   # <--- Merged generic
     "Le Bourget Paris, France": "Paris (Le Bourget)",
     "Paris (Le Bourget)": "Paris (Le Bourget)",
+    # ----------------------------
+
     "Nice, France": "Nice",
     "Geneva, Switzerland": "Geneva",
     "Zurich, Switzerland": "Zurich",
@@ -44,9 +48,9 @@ AIRPORT_MAPPING = {
     "New York (Teterboro)": "New York (Teterboro)",
     "White Plains, NY": "New York (White Plains)",
     
-    # --- CA Variations (THE FIX) ---
-    "Los Angeles, US": "Los Angeles (Van Nuys)", # Merged
-    "Los Angeles": "Los Angeles (Van Nuys)",     # Merged generic LA into Van Nuys
+    # --- CA Variations ---
+    "Los Angeles, US": "Los Angeles (Van Nuys)", 
+    "Los Angeles": "Los Angeles (Van Nuys)",     
     "Van Nuys, California": "Los Angeles (Van Nuys)",
     "Van Nuys, CA": "Los Angeles (Van Nuys)",
     
@@ -64,14 +68,12 @@ def normalize_airport(name):
     if not name or pd.isna(name):
         return None
     
-    # Clean string
     clean_name = str(name).strip()
     
     # Reject explicit "0" strings
     if clean_name == '0':
         return None
         
-    # Return mapped name, or original if not in map
     return AIRPORT_MAPPING.get(clean_name, clean_name)
 
 def fetch_flights():
@@ -107,11 +109,11 @@ def analyze_network_balance(df):
     balance['arrivals'] = balance['arrivals'].fillna(0)
     balance['departures'] = balance['departures'].fillna(0)
     
-    # 3. FILTER OUT SPECIFIC ARTIFACTS
+    # 3. FILTER OUT ARTIFACTS
     invalid_entries = ["0", 0, "Los Angeles, California -> Van Nuys, California"]
     balance = balance[~balance['airport'].isin(invalid_entries)]
     
-    # 4. AGGREGATE AGAIN (Crucial Step)
+    # 4. AGGREGATE AGAIN (Crucial Step for merging Paris)
     balance = balance[['competitor', 'airport', 'arrivals', 'departures']]
     balance = balance.groupby(['competitor', 'airport']).sum().reset_index()
     
@@ -166,7 +168,6 @@ if __name__ == "__main__":
     if not df.empty:
         balance = analyze_network_balance(df)
         print("\n--- NETWORK IMBALANCE REPORT ---")
-        # Print non-zero flows for debugging
         print(balance[balance['net_flow'] != 0])
         plot_balance_sheet(balance)
     else:
